@@ -2,39 +2,21 @@ const express = require('express');
 const axios = require('axios');
 const path = require('path');
 const bodyParser = require('body-parser');
-const crypto = require('crypto');
-
 const app = express();
 app.use(express.json());
 app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, 'public')));
-
 const total = new Map();
-
-// ============================================================
-// KONFIGURASYON PARA SA PAGE PUBLISHING
-// ============================================================
-// Palitan ang dalawang ito ng totoong Page ID at Page Access Token.
-// Ang Page Access Token ay nakuha mula sa Graph API Explorer
-// (pumili ng Page, pagkatapos ay kunin ang token na may
-//  pages_manage_posts at pages_read_engagement permissions).
-const PAGE_ID = process.env.FB_PAGE_ID || 'ILAGAY_DITO_ANG_PAGE_ID';
-const PAGE_ACCESS_TOKEN =
-  process.env.FB_PAGE_ACCESS_TOKEN || 'ILAGAY_DITO_ANG_PAGE_ACCESS_TOKEN';
-
-// ============================================================
-// ROUTES
-// ============================================================
 
 app.get('/total', (req, res) => {
   const data = Array.from(total.values()).map((link, index) => ({
-    session: link.session,
+    session: index + 1,
     url: link.url,
     count: link.count,
     id: link.id,
     target: link.target,
   }));
-  res.json(data);
+  res.json(JSON.parse(JSON.stringify(data || [], null, 2)));
 });
 
 app.get('/', (res) => {
@@ -43,7 +25,6 @@ app.get('/', (res) => {
 
 app.post('/api/submit', async (req, res) => {
   const { cookie, url, amount, interval } = req.body;
-
   if (!cookie || !url || !amount || !interval) {
     return res.status(400).json({
       error: 'Missing state, url, amount, or interval',
@@ -58,152 +39,95 @@ app.post('/api/submit', async (req, res) => {
         error: 'Invalid cookies',
       });
     }
-
-    // Ang share() ay hindi na naghihintay ng buong proseso;
-    // agad itong nagbabalik pagkatapos ma-validate ang input.
-    await share(cookies, url, Number(amount), Number(interval));
-
+    await share(cookies, url, amount, interval);
     res.status(200).json({ status: 200 });
   } catch (err) {
     return res.status(500).json({
       status: 500,
-      error: err.message || String(err),
+      error: err.message || err,
     });
   }
 });
-
-// ============================================================
-// SHARE LOGIC (PAGE-BASED PUBLISHING)
-// ============================================================
 
 async function share(cookies, url, amount, interval) {
   const id = await getPostID(url);
   if (!id) {
     throw new Error(
-      'Unable to get link id: invalid URL, private post, or unsupported share link'
+      "Unable to get link id: invalid URL, private post, or unsupported share link"
     );
   }
 
-  // I-validate na may Page token bago magsimula
-  if (
-    !PAGE_ID ||
-    PAGE_ID === 'ILAGAY_DITO_ANG_PAGE_ID' ||
-    !PAGE_ACCESS_TOKEN ||
-    PAGE_ACCESS_TOKEN === 'ILAGAY_DITO_ANG_PAGE_ACCESS_TOKEN'
-  ) {
-    throw new Error(
-      'Page publishing is not configured. Set FB_PAGE_ID and FB_PAGE_ACCESS_TOKEN.'
-    );
+  const accessToken = await getAccessToken(cookies);
+  if (!accessToken) {
+    throw new Error('Unable to get access token: invalid or expired appstate');
   }
 
-  // I-check kung may tumatakbo nang proseso para sa parehong post ID
-  for (const entry of total.values()) {
-    if (entry.id === id && entry.running) {
-      throw new Error(`A share process for post ID ${id} is already running.`);
-    }
-  }
-
-  const session = crypto.randomUUID();
-  total.set(session, {
-    session,
+  const postId = total.has(id) ? id + '-' + Date.now() : id;
+  total.set(postId, {
     url,
     id,
     count: 0,
     target: amount,
-    running: true,
   });
 
   const headers = {
     accept: '*/*',
+    'accept-encoding': 'gzip, deflate',
+    connection: 'keep-alive',
+    'content-length': '0',
     cookie: cookies,
     host: 'graph.facebook.com',
   };
 
   let sharedCount = 0;
-  let timer;
+  let stopped = false;
 
   async function sharePost() {
+    if (stopped) return;
+
     try {
       const response = await axios.post(
-        `https://graph.facebook.com/${PAGE_ID}/feed`,
-        {
-          link: `https://m.facebook.com/${id}`,
-          published: false,
-          access_token: PAGE_ACCESS_TOKEN,
-        },
+        `https://graph.facebook.com/me/feed?link=https://m.facebook.com/${id}&published=0&access_token=${accessToken}`,
+        {},
         { headers }
       );
 
       if (response.status === 200) {
-        const current = total.get(session);
-        if (current) {
-          current.count += 1;
-          total.set(session, current);
-        }
         sharedCount++;
-
-        if (sharedCount >= amount) {
-          clearInterval(timer);
-          const done = total.get(session);
-          if (done) {
-            done.running = false;
-            total.set(session, done);
-          }
-        }
+        total.set(postId, {
+          ...total.get(postId),
+          count: sharedCount,
+        });
+        console.log(`Share ${sharedCount}/${amount} successful`);
       }
+
+      if (sharedCount >= amount) {
+        stopped = true;
+        total.delete(postId);
+        console.log(`Done: ${sharedCount}/${amount} shares completed`);
+        return;
+      }
+
+      setTimeout(sharePost, interval * 1000);
     } catch (error) {
-      console.error(
-        'sharePost error:',
-        error.response?.data || error.message
-      );
-      clearInterval(timer);
-      total.delete(session);
+      console.error('sharePost error:', error.response?.data || error.message);
+      stopped = true;
+      total.delete(postId);
     }
   }
 
-  // Unang share agad, pagkatapos ay interval
   sharePost();
-  timer = setInterval(sharePost, interval * 1000);
-
-  // Safety timeout para hindi tumakbo nang walang hanggan
-  setTimeout(() => {
-    clearInterval(timer);
-    const entry = total.get(session);
-    if (entry && entry.running) {
-      entry.running = false;
-      total.set(session, entry);
-    }
-  }, amount * interval * 1000 + 5000);
 }
-
-// ============================================================
-// POST ID PARSING
-// ============================================================
 
 async function getPostID(url) {
   try {
-    // Early return kung may fbid= o story_fbid= na sa URL
-    const directFbid = url.match(/[?&]fbid=(\d+)/);
-    if (directFbid) {
-      console.log('Direct fbid found:', directFbid[1]);
-      return directFbid[1];
-    }
-
-    const directStory = url.match(/[?&]story_fbid=(\d+)/);
-    if (directStory) {
-      console.log('Direct story_fbid found:', directStory[1]);
-      return directStory[1];
-    }
-
-    // Kung share link, sundan ang redirect
     const resolved = await axios.get(url, {
       maxRedirects: 5,
       validateStatus: () => true,
       headers: {
         'user-agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        accept:
-          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       },
     });
 
@@ -214,8 +138,8 @@ async function getPostID(url) {
 
     const patterns = [
       /\/posts\/(\d+)/,
-      /[?&]story_fbid=(\d+)/,
-      /[?&]fbid=(\d+)/,
+      /story_fbid=(\d+)/,
+      /\/photo\.php\?fbid=(\d+)/,
       /\/reel\/(\d+)/,
       /\/videos\/(\d+)/,
       /\/permalink\/(\d+)/,
@@ -227,7 +151,6 @@ async function getPostID(url) {
       if (match) return match[1];
     }
 
-    // Fallback sa third-party service
     const response = await axios.post(
       'https://id.traodoisub.com/api.php',
       `link=${encodeURIComponent(url)}`,
@@ -246,19 +169,13 @@ async function getPostID(url) {
   }
 }
 
-// ============================================================
-// ACCESS TOKEN (para sa user token, hindi na kailangan sa Page
-// publishing, pero pinapanatili para sa compatibility)
-// ============================================================
-
 async function getAccessToken(cookie) {
   try {
     const headers = {
       authority: 'business.facebook.com',
       accept:
         'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9',
-      'accept-language':
-        'vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5',
+      'accept-language': 'vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5',
       'cache-control': 'max-age=0',
       cookie: cookie,
       referer: 'https://www.facebook.com/',
@@ -278,30 +195,26 @@ async function getAccessToken(cookie) {
     );
     const token = response.data.match(/"accessToken":\s*"([^"]+)"/);
     if (token && token[1]) {
-      return token[1];
+      const accessToken = token[1];
+      return accessToken;
     }
   } catch (error) {
-    return null;
+    return;
   }
 }
-
-// ============================================================
-// COOKIE CONVERSION
-// ============================================================
 
 async function convertCookie(cookie) {
   return new Promise((resolve, reject) => {
     try {
       const cookies = JSON.parse(cookie);
-      const sbCookie = cookies.find((c) => c.key === 'sb');
+      const sbCookie = cookies.find((cookies) => cookies.key === 'sb');
       if (!sbCookie) {
         reject('Detect invalid appstate please provide a valid appstate');
-        return;
       }
       const sbValue = sbCookie.value;
       const data = `sb=${sbValue}; ${cookies
         .slice(1)
-        .map((c) => `${c.key}=${c.value}`)
+        .map((cookies) => `${cookies.key}=${cookies.value}`)
         .join('; ')}`;
       resolve(data);
     } catch (error) {
@@ -310,11 +223,6 @@ async function convertCookie(cookie) {
   });
 }
 
-// ============================================================
-// START SERVER
-// ============================================================
-
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+app.listen(5000, () => {
+  console.log('Server running on port 5000');
 });
